@@ -1,0 +1,16 @@
+{
+  "agendas": [
+    {
+      "id": "default",
+      "title": "单议题头脑风暴",
+      "description": "默认议题，如果未与多议程系统联动，则始终使用此配置。",
+      "secretary": "ProductExpert",
+      "experts": [
+        "ProductExpert",
+        "TechExpert",
+        "DesignExpert",
+        "MarketingExpert"
+      ]
+    }
+  ]
+}

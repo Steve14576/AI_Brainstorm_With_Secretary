@@ -53,6 +53,120 @@ def load_agents_config(config_file: str = "agents1.json"):
     return config.get("agents", [])
 
 
+def review_arrangements(
+    base_host: Optional[AssistantAgent],
+    base_experts: List[AssistantAgent],
+    filename: str = "arrangements.json",
+) -> Tuple[Optional[AssistantAgent], List[AssistantAgent]]:
+    """在会议正式开始前，按 arrangements.json 反复确认本轮将采用的秘书与专家。
+
+    每次循环：
+    - 读取并应用 arrangements.json（由 apply_arrangements 负责解析与容错）
+    - 在终端公布当前计算出的秘书与专家名单
+    - 用户输入非空内容视为刚修改过文件，将再次读取并公布；
+      只有在用户直接回车时才最终确认本轮安排并返回。
+    """
+    current_host = base_host
+    current_experts = base_experts
+
+    while True:
+        print("\n" + "-" * 60)
+        print(f"📂 正在根据 {filename} 计算本轮将采用的秘书与专家...")
+        current_host, current_experts = apply_arrangements(base_host, base_experts, filename)
+
+        user_input = input(
+            "\n如已确认以上安排，直接回车开始会议；\n"
+            "如果你刚刚修改过 arrangements.json，请输入任意内容后回车以重新载入："
+        ).strip()
+        if not user_input:
+            break
+
+    return current_host, current_experts
+
+
+def apply_arrangements(
+    host_agent: Optional[AssistantAgent],
+    expert_agents: List[AssistantAgent],
+    filename: str = "arrangements.json",
+) -> Tuple[Optional[AssistantAgent], List[AssistantAgent]]:
+    """根据 arrangements.json 选择本次会议实际使用的秘书与专家集合。
+
+    - 优先查找 id="default" 的议程；否则取列表中的第一个议程。
+    - secretary 字段指定本次会议使用的秘书 name。
+    - experts 列表指定本次会议参加的专家 name 集合。
+    未命中时回退到 agents1.json 中默认加载的角色。
+    """
+    if not os.path.exists(filename):
+        return host_agent, expert_agents
+
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return host_agent, expert_agents
+
+    agendas = data.get("agendas") or []
+    agenda = None
+    for item in agendas:
+        if item.get("id") == "default":
+            agenda = item
+            break
+    if agenda is None and agendas:
+        agenda = agendas[0]
+    if agenda is None:
+        print("⚠️ arrangements.json 中未找到任何有效议程配置，将按 agents1.json 的默认角色配置运行。")
+        return host_agent, expert_agents
+
+    secretary_name = agenda.get("secretary")
+    expert_names = agenda.get("experts") or []
+
+    # 构建 name -> Agent 映射，方便通过名字选人
+    name_to_agent: dict[str, AssistantAgent] = {}
+    if host_agent:
+        name_to_agent[host_agent.name] = host_agent
+    for agent in expert_agents:
+        if agent.name not in name_to_agent:
+            name_to_agent[agent.name] = agent
+
+    # 按 arrangements.json 重新确定秘书
+    new_host = host_agent
+    if secretary_name:
+        if secretary_name in name_to_agent:
+            new_host = name_to_agent[secretary_name]
+        else:
+            print(f"⚠️ arrangements.json 中 secretary=‘{secretary_name}’ 在 agents1.json 中找不到，对应秘书保持为 {host_agent.name if host_agent else '（无）'}。")
+
+    # 按 arrangements.json 过滤/排序专家列表
+    new_experts: List[AssistantAgent] = []
+    if expert_names:
+        for name in expert_names:
+            agent = name_to_agent.get(name)
+            if not agent:
+                print(f"⚠️ arrangements.json 中 experts 项 ‘{name}’ 在 agents1.json 中找不到，将忽略该专家。")
+                continue
+            if agent is not new_host and agent not in new_experts:
+                new_experts.append(agent)
+    else:
+        # 未显式指定 experts 时，沿用原有专家列表，但排除秘书自身
+        for agent in expert_agents:
+            if agent is not new_host:
+                new_experts.append(agent)
+
+    # 公布本轮最终将采用的角色安排
+    print("\n🧾 本轮将采用的角色安排（来自 arrangements.json）：")
+    agenda_title = agenda.get("title") or agenda.get("id") or "(未命名议程)"
+    print(f"  议程: {agenda_title}")
+    print(f"  秘书: {new_host.name if new_host else '（无）'}")
+    if new_experts:
+        print("  专家:")
+        for idx, ag in enumerate(new_experts, start=1):
+            print(f"    {idx}. {ag.name}")
+    else:
+        print("  专家: （无专家参与）")
+
+    return new_host, new_experts
+
+
 def create_agents(config_file: str = "agents1.json"):
     """创建所有Agent（秘书+专家），支持不同模型"""
     agents_config = load_agents_config(config_file)
@@ -501,11 +615,12 @@ async def run_brainstorm(topic: str, max_rounds: int = 10):
     # 1. 创建所有Agent（主持人+专家）
     print("\n🤖 正在初始化Agent...")
     host_agent, expert_agents = create_agents()
+
+    # 1.1 在正式开会前，根据 arrangements.json 反复确认本轮将采用的秘书与专家
+    host_agent, expert_agents = review_arrangements(host_agent, expert_agents)
     expert_names = [agent.name for agent in expert_agents]
-    
-    if host_agent:
-        print(f"\n🎤 秘书：{host_agent.name}")
-    print(f"👥 参会专家：{', '.join(expert_names)}")
+
+    # 此处不再重复打印角色，review_arrangements/apply_arrangements 已经公布了本轮安排
     
     # 2. 初始化对话历史
     all_messages = []
