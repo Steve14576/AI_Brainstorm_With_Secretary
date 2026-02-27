@@ -117,6 +117,145 @@ def save_announcement(
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+def open_draft_session(stage_label: str, filename: str = "secretaryannouncements.json") -> int:
+    """在 secretaryannouncements.json 中为本次私聊开屏一条新记录，返回该记录的 id。
+
+    记录初始状态: announcement 为空，published = False。
+    后续由 update_draft_in_place 和 finalize_draft 逐步完善。
+    """
+    try:
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        else:
+            records = []
+    except Exception:
+        records = []
+
+    new_id = len(records) + 1
+    record = {
+        "id": new_id,
+        "stage": stage_label,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "chat": [],
+        "announcement": "",
+        "decision_input": "",
+        "published": False,
+    }
+    records.append(record)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    return new_id
+
+
+def update_draft_in_place(
+    record_id: int,
+    session_chat: List[dict],
+    new_text: str,
+    filename: str = "secretaryannouncements.json",
+):
+    """静默将指定 id 的记录的 announcement 字段原地更新。
+
+    终端不打印任何内容，就像文本编辑器静默修改文件一样。
+    """
+    try:
+        if not os.path.exists(filename):
+            return
+        with open(filename, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        for rec in records:
+            if rec["id"] == record_id:
+                rec["chat"] = session_chat
+                rec["announcement"] = new_text
+                break
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def finalize_draft(
+    record_id: int,
+    session_chat: List[dict],
+    decision_input: str,
+    published: bool,
+    filename: str = "secretaryannouncements.json",
+):
+    """将指定 id 的记录标记为已决策（发表/不发表）。终端不打印。"""
+    try:
+        if not os.path.exists(filename):
+            return
+        with open(filename, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        for rec in records:
+            if rec["id"] == record_id:
+                rec["chat"] = session_chat
+                rec["decision_input"] = decision_input
+                rec["published"] = published
+                break
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+async def maybe_update_announcement(
+    host: AssistantAgent,
+    topic: str,
+    stage_label: str,
+    current_draft: Optional[str],
+    last_user_msg: str,
+    last_secretary_reply: str,
+    stage_code: str,
+    all_messages: List[dict],
+) -> Tuple[bool, Optional[str]]:
+    """隐形意图识别：判断主持人这一轮说的话是否需要更新 announcement。
+
+    如果需要，返回 (True, 新全文)；否则返回 (False, None)。
+    该函数在终端不打印任何内容，完全静默运行。
+    """
+    current_draft_text = current_draft or "（尚未起草）"
+
+    system_prompt = (
+        f"你是会议秘书，正在帮主持人起草一份公告（announcement）草稿。\n"
+        f"主题: 「{topic}」，当前阶段: 「{stage_label}」。\n\n"
+        f"【当前公告草稿】\n{current_draft_text}\n\n"
+        f"【最新一轮私聊】\n"
+        f"主持人: {last_user_msg}\n"
+        f"秘书: {last_secretary_reply}\n\n"
+        "请判断：主持人这一轮的发言，是否包含对公告内容的修改意图？\n"
+        "（例如：提出新的重点、要求改语气/措辞、要删某个点、根据专家发言做调整）\n"
+        "如果没有（只是闲聊、问解释、表达情绪），则 should_update = false。\n\n"
+        "只输出一个 JSON 对象，格式如下，不要包含任何其他内容：\n"
+        '{"should_update": true, "new_announcement": "改好后的公告全文"}\n'
+        '{"should_update": false, "new_announcement": ""}'
+    )
+
+    messages = [TextMessage(content=system_prompt, source="system")]
+    if all_messages:
+        for msg in all_messages[-15:]:
+            src = msg.get("source", "Other")
+            messages.append(TextMessage(
+                content=f"[{src}] {msg.get('content', '')}",
+                source=src,
+            ))
+
+    try:
+        response = await host.on_messages(messages, cancellation_token=None)
+        raw = response.chat_message.content.strip()
+        # 容迍模型用 ```json ... ``` 包裹返回
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+        data = json.loads(raw)
+        should_update = bool(data.get("should_update", False))
+        new_text = data.get("new_announcement", "").strip() if should_update else None
+        return should_update, new_text if new_text else None
+    except Exception:
+        return False, None
+
+
 def append_secretary_log(line: str, filename: str = "secretarynote.txt"):
     """追加秘书笔记到本地文件"""
     try:
@@ -183,20 +322,22 @@ async def secretary_chat_session(
     stage_label: str,
     stage_code: str,
 ) -> Optional[str]:
-    """与秘书进行多轮私聊对话。
+    """与秘书进行多轮私聊对话，背后静默向 secretaryannouncements.json 实时更新公告草稿。
 
-    聊天时秘书可以参考本次会议的公开历史（专家发言等）+ 本次私聊记录，
-    用口语方式帮你解释刚才的讨论，并一起酝酿当次 announcement 的思路。
-    用户直接回车才结束私聊，随后秘书再基于完整上下文起草公示稿，
-    结果写入 secretaryannouncements.json。
+    流程：
+    - 每轮私聊: 秘书口语回应 → maybe_update_announcement 隐形判断 → 如有修改就静默写入 JSON
+    - 终端只显示秘书的口语回应 + 公告是否被更新的提示符
+    - 回车结束私聊后展示最终草稿，询问发表/不发表
     """
-    print(f"\n📝 秘书凑过来（{stage_label})...")
+    print(f"\n📝 秘书凑过来（{stage_label}）... 📏 公告草稿实时在 secretaryannouncements.json 更新")
     session_chat: List[dict] = []
     current_draft: Optional[str] = None
-    draft_version: int = 0
+
+    # 就地开一个插槽，返回 record_id以便后续就地更新
+    record_id = open_draft_session(stage_label)
 
     while True:
-        user_msg = input("【私语】你对秘书说（直接回车结束私聊）：").strip()
+        user_msg = input("《私语》你对秘书说（直接回车结束私聊）：").strip()
         if not user_msg:
             break
 
@@ -204,41 +345,38 @@ async def secretary_chat_session(
         secretary_notes.append({"source": "HostPrivate", "content": f"[{stage_label}] {user_msg}"})
         append_secretary_log(f"[PRIVATE][{stage_label}] {user_msg}")
 
-        # 秘书在私聊时会参考会议历史，但仍以口语方式解释，不直接写总结
+        # 秘书口语回应（看会议历史 + 本次私聊，自然地趟你聊）
         reply = await _secretary_chat_reply(host_agent, session_chat, topic, stage_label, all_messages)
         print(f"\n🤫 [秘书]: {reply}\n")
         session_chat.append({"role": "secretary", "content": reply})
         secretary_notes.append({"source": "SecretaryPrivate", "content": reply})
         append_secretary_log(f"[PRIVATE_REPLY][{stage_label}] {reply}")
 
-        # 每轮私聊之后，秘书根据当前会议历史 + 私语笔记，起草一版最新的 announcement 草稿
-        draft_version += 1
-        ctx_draft_loop = all_messages + secretary_notes
-        current_draft = await get_host_response(host_agent, ctx_draft_loop, topic, stage=stage_code)
-
-        print(f"\n{'=' * 60}")
-        print(f"📄 当前公示稿草稿 v{draft_version}（{stage_label}）")
-        print(f"{'=' * 60}")
-        print(current_draft)
-        print(f"{'=' * 60}\n")
-
-        # 将本次草稿版本也记录到 secretaryannouncements.json 中，标记为草稿（未发表）
-        save_announcement(
-            session_chat=session_chat,
-            draft=current_draft,
-            stage_label=f"{stage_label}-草稿v{draft_version}",
-            published=False,
-            decision_input=f"draft-{draft_version}",
+        # 隐形意图识别：判断是否需要更新 announcement
+        should_update, new_text = await maybe_update_announcement(
+            host_agent,
+            topic,
+            stage_label,
+            current_draft,
+            user_msg,
+            reply,
+            stage_code,
+            all_messages,
         )
+        if should_update and new_text:
+            current_draft = new_text
+            update_draft_in_place(record_id, session_chat, current_draft)
+            print("📏 announcement 已更新（见 secretaryannouncements.json）")
 
-    # 私聊结束，这时基于完整上下文（会议历史+私语笔记）起草公示稿最终版本
-    print(f"\n⏳ 秘书正在起草公示稿最终版...")
-    ctx_draft = all_messages + secretary_notes
+    # 私聊结束：如果一轮都没有触发 maybe_update，做一次兼底全量生成
     if current_draft is None:
+        print(f"\n⏳ 秘书正在起草公示稿...")
+        ctx_draft = all_messages + secretary_notes
         current_draft = await get_host_response(host_agent, ctx_draft, topic, stage=stage_code)
+        update_draft_in_place(record_id, session_chat, current_draft)
 
     print(f"\n{'=' * 60}")
-    print(f"📄 秘书拟定的公示稿（{stage_label}）")
+    print(f"📄 公示稿内容（{stage_label}）")
     print(f"{'=' * 60}")
     print(current_draft)
     print(f"{'=' * 60}\n")
@@ -246,7 +384,7 @@ async def secretary_chat_session(
     decision_raw = input("发表此次 announcement？(y=发表 / n=不发表)：").strip().lower()
     published = decision_raw in ["", "y", "yes", "是", "ok"]
 
-    save_announcement(session_chat, current_draft, stage_label, published, decision_raw)
+    finalize_draft(record_id, session_chat, decision_raw, published)
 
     if published:
         append_secretary_log(f"[PUBLIC][{stage_label}][秘书公示]: {current_draft}")
